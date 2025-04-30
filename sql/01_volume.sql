@@ -1,30 +1,25 @@
-WITH transfers AS (
+WITH daily_prices AS (
   SELECT
-    DATE_TRUNC('day', t.evt_block_time) AS day,
-    t.contract_address,
-    SUM((
-      t.value / POWER(10, COALESCE(m.decimals, 18))
-    ) * p.price) AS volume_usd
-  FROM erc20_ethereum.evt_transfer AS t
-  JOIN prices.usd AS p
-    ON t.contract_address = p.contract_address
-    AND DATE_TRUNC('minute', t.evt_block_time) = p.minute
-  LEFT JOIN tokens.erc20 AS m
-    ON t.contract_address = m.contract_address
+    p.contract_address AS token_address,
+    DATE_TRUNC('day', p.minute) AS day,
+    AVG(p.price) AS avg_price
+  FROM prices.usd AS p
   WHERE
-    t.contract_address IN (0x6982508145454ce325ddbe47a25d4ec3d2311933 /* PEPE */, 0xcf0c122c6b73ff809c693db761e7baebe62b6a2e /* FLOKI */,  0xaaee1a9723aadb7afa2810263653a34ba2c21c7a /* MOG */, 0x95ad61b0a150d79219dcf64e1e6cc01f0b64c4ce /* SHIB */)
+    p.contract_address IN (0x6982508145454ce325ddbe47a25d4ec3d2311933 /* PEPE */, 0xcf0c122c6b73ff809c693db761e7baebe62b6a2e /* FLOKI */,  0xaaee1a9723aadb7afa2810263653a34ba2c21c7a /* MOG */, 0x95ad61b0a150d79219dcf64e1e6cc01f0b64c4ce /* SHIB */)
   GROUP BY
     1,
     2
+), log_returns AS (
+  SELECT
+    token_address,
+    day,
+    LN(avg_price / LAG(avg_price) OVER (PARTITION BY token_address ORDER BY day)) AS log_return
+  FROM daily_prices
 )
 SELECT
+  token_address,
   day,
-  contract_address,
-  SUM(volume_usd) AS total_volume_usd
-FROM transfers
-GROUP BY
-  day,
-  contract_address
+  STDDEV_SAMP(log_return) OVER (PARTITION BY token_address ORDER BY day ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) AS vol_7d
+FROM log_returns
 ORDER BY
-  day DESC,
-  total_volume_usd DESC
+  day DESC
