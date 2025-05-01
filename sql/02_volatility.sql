@@ -1,25 +1,42 @@
-WITH daily_prices AS (
-  SELECT
-    p.contract_address AS token_address,
-    DATE_TRUNC('day', p.minute) AS day,
-    AVG(p.price) AS avg_price
-  FROM prices.usd AS p
-  WHERE
-    p.contract_address IN (0x6982508145454ce325ddbe47a25d4ec3d2311933 /* PEPE */, 0xfb5b838b6cfeedc2873ab27866079ac55363d37e /* FLOKI */,  0x2f2a2543b76a4166549f7aab2e75bef0aefc5b0f /* SAFE */, 0x95ad61b0a150d79219dcf64e1e6cc01f0b64c4ce /* SHIB */)
-  GROUP BY
-    1,
-    2
-), log_returns AS (
-  SELECT
-    token_address,
-    day,
-    LN(avg_price / LAG(avg_price) OVER (PARTITION BY token_address ORDER BY day)) AS log_return
-  FROM daily_prices
-)
-SELECT
-  token_address,
-  day,
-  STDDEV_SAMP(log_return) OVER (PARTITION BY token_address ORDER BY day ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) AS vol_7d
-FROM log_returns
-ORDER BY
-  day DESC
+with daily_prices as (
+    select
+        p.contract_address as token_address
+        , DATE_TRUNC('day', p.minute) as day
+        , AVG(p.price) as avg_price
+        from prices.usd as p
+        where CAST(p.contract_address as VARCHAR) in (
+                select
+                    *
+                from unnest (split('{{token_list}}', ',')) as token_address)
+   and p.minute >= NOW() - INTERVAL '40' DAY
+        group by
+    1
+    , 2)
+    , log_returns as (
+        select
+        token_address
+        , day
+        , LN(
+                avg_price / LAG(avg_price) over (
+                    partition by
+                        token_address
+                    order by
+    day)) as log_return
+        from daily_prices)
+        , volatility as (
+        select
+        token_address
+        , day
+        , STDDEV_SAMP(log_return) over (
+                partition by
+                    token_address
+                order by
+    day rows between 6 preceding
+   and current ROW) as vol_7d
+        from log_returns)
+select
+    *
+from volatility
+order by
+    day desc
+    , token_address
