@@ -4,10 +4,9 @@ with daily_prices as (
         , DATE_TRUNC('day', p.minute) as day
         , AVG(p.price) as avg_price
         from prices.usd as p
-        where CAST(p.contract_address as VARCHAR) in (
-                select
-                    *
-                from unnest (split('{{token_list}}', ',')) as token_address)
+        where LOWER(CAST(p.contract_address as VARCHAR)) in (
+                select LOWER(token_address)
+                from unnest (split('{{token_list}}', ',')) as t(token_address))
    and p.minute >= NOW() - INTERVAL '40' DAY
         group by
     1
