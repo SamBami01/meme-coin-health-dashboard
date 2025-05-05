@@ -1,0 +1,136 @@
+-- Token Filter
+WITH token_filter AS (
+  SELECT LOWER(token_address) AS token_address
+  FROM UNNEST(SPLIT('{{token_list}}', ',')) AS t(token_address)
+),
+
+-- Volume (USD)
+filtered_transfers AS (
+  SELECT *
+  FROM erc20_ethereum.evt_transfer
+  WHERE LOWER(CAST(contract_address AS VARCHAR)) IN (SELECT token_address FROM token_filter)
+    AND evt_block_time >= NOW() - INTERVAL '30' DAY
+),
+transfers AS (
+  SELECT
+    DATE_TRUNC('day', t.evt_block_time) AS day,
+    t.contract_address,
+    SUM((t.value / POWER(10, COALESCE(m.decimals, 18))) * p.price) AS volume_usd
+  FROM filtered_transfers t
+  LEFT JOIN tokens.erc20 AS m ON t.contract_address = m.contract_address
+  INNER JOIN prices.usd AS p 
+    ON t.contract_address = p.contract_address
+    AND DATE_TRUNC('day', p.minute) = DATE_TRUNC('day', t.evt_block_time)
+  GROUP BY 1, 2
+),
+
+-- Volatility (7-day rolling stddev of log returns)
+daily_prices AS (
+  SELECT
+    p.contract_address AS token_address,
+    DATE_TRUNC('day', p.minute) AS day,
+    AVG(p.price) AS avg_price
+  FROM prices.usd AS p
+  WHERE LOWER(CAST(p.contract_address AS VARCHAR)) IN (SELECT token_address FROM token_filter)
+    AND p.minute >= NOW() - INTERVAL '40' DAY
+  GROUP BY 1, 2
+),
+log_returns AS (
+  SELECT
+    token_address,
+    day,
+    LN(avg_price / LAG(avg_price) OVER (PARTITION BY token_address ORDER BY day)) AS log_return
+  FROM daily_prices
+),
+volatility_raw AS (
+  SELECT
+    token_address,
+    day,
+    STDDEV_SAMP(log_return) OVER (PARTITION BY token_address ORDER BY day ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) AS vol_7d
+  FROM log_returns
+),
+
+-- Traders
+wallets AS (
+  SELECT
+    DATE_TRUNC('day', evt_block_time) AS day,
+    contract_address,
+    "from" AS wallet
+  FROM erc20_ethereum.evt_transfer
+  WHERE LOWER(CAST(contract_address AS VARCHAR)) IN (SELECT token_address FROM token_filter)
+  UNION
+  SELECT
+    DATE_TRUNC('day', evt_block_time),
+    contract_address,
+    "to" AS wallet
+  FROM erc20_ethereum.evt_transfer
+  WHERE LOWER(CAST(contract_address AS VARCHAR)) IN (SELECT token_address FROM token_filter)
+),
+traders_raw AS (
+  SELECT
+    day,
+    contract_address,
+    COUNT(DISTINCT wallet) AS unique_traders
+  FROM wallets
+  GROUP BY 1, 2
+),
+
+-- Combine All Metrics
+combined AS (
+  SELECT
+    v.day,
+    v.contract_address AS token_address,
+    v.volume_usd,
+    t.unique_traders,
+    vol.vol_7d
+  FROM transfers v
+  LEFT JOIN traders_raw t ON v.day = t.day AND v.contract_address = t.contract_address
+  LEFT JOIN volatility_raw vol ON v.day = vol.day AND v.contract_address = vol.token_address
+),
+
+-- Normalized Health Score
+normalized AS (
+  SELECT
+    day,
+    token_address,
+
+    -- Volume
+    ROUND(COALESCE(
+      (volume_usd - MIN(volume_usd) OVER (PARTITION BY day)) /
+      NULLIF(MAX(volume_usd) OVER (PARTITION BY day) - MIN(volume_usd) OVER (PARTITION BY day), 0),
+      1
+    ), 4) AS vol_norm,
+
+    -- Inverted volatility
+    ROUND(COALESCE(
+      1 - (
+        (vol_7d - MIN(vol_7d) OVER (PARTITION BY day)) /
+        NULLIF(MAX(vol_7d) OVER (PARTITION BY day) - MIN(vol_7d) OVER (PARTITION BY day), 0)
+      ),
+      1
+    ), 4) AS volat_norm,
+
+    -- Unique traders
+    ROUND(COALESCE(
+      (unique_traders - MIN(unique_traders) OVER (PARTITION BY day)) /
+      NULLIF(MAX(unique_traders) OVER (PARTITION BY day) - MIN(unique_traders) OVER (PARTITION BY day), 0),
+      1
+    ), 4) AS trd_norm
+  FROM combined
+),
+
+-- Final Score
+health_score_final AS (
+  SELECT
+    day,
+    token_address,
+    vol_norm,
+    trd_norm,
+    volat_norm,
+    ROUND(0.4 * vol_norm + 0.3 * trd_norm + 0.3 * volat_norm, 4) AS health_score
+  FROM normalized
+)
+
+SELECT *
+FROM health_score_final
+ORDER BY day DESC, health_score DESC;
